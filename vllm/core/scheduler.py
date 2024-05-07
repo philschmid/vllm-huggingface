@@ -13,7 +13,6 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceStatus)
-from vllm.utils import merge_dicts
 
 logger = init_logger(__name__)
 
@@ -122,12 +121,14 @@ class SchedulerOutputs:
     blocks_to_swap_in: Dict[int, int]
     # Blocks to swap out. Dict of GPU -> CPU block number.
     blocks_to_swap_out: Dict[int, int]
-    # Blocks to copy. Source to a list of dest blocks.
-    blocks_to_copy: Dict[int, List[int]]
+    # Blocks to copy. Source to dest block.
+    blocks_to_copy: List[Tuple[int, int]]
     # Sequence groups that are going to be ignored.
     ignored_seq_groups: List[SequenceGroup]
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
+    # The number of requests in the running queue
+    running_queue_size: int
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
@@ -175,7 +176,7 @@ class SchedulerRunningOutputs:
     # The blocks to swap out.
     blocks_to_swap_out: Dict[int, int]
     # The blocks to copy.
-    blocks_to_copy: Dict[int, List[int]]
+    blocks_to_copy: List[Tuple[int, int]]
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
 
@@ -187,7 +188,7 @@ class SchedulerRunningOutputs:
             preempted=[],
             swapped_out=[],
             blocks_to_swap_out={},
-            blocks_to_copy={},
+            blocks_to_copy=[],
             num_lookahead_slots=0,
         )
 
@@ -207,9 +208,11 @@ class SchedulerSwappedInOutputs:
     # The blocks to swap in.
     blocks_to_swap_in: Dict[int, int]
     # The blocks to copy.
-    blocks_to_copy: Dict[int, List[int]]
+    blocks_to_copy: List[Tuple[int, int]]
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
+    # Infeasible sequence groups.
+    infeasible_seq_groups: List[SequenceGroup]
 
     @classmethod
     def create_empty(cls) -> "SchedulerSwappedInOutputs":
@@ -217,8 +220,9 @@ class SchedulerSwappedInOutputs:
             decode_seq_groups=[],
             prefill_seq_groups=[],
             blocks_to_swap_in={},
-            blocks_to_copy={},
+            blocks_to_copy=[],
             num_lookahead_slots=0,
+            infeasible_seq_groups=[],
         )
 
 
@@ -389,7 +393,7 @@ class Scheduler:
         """
         # Blocks that need to be swapped or copied before model execution.
         blocks_to_swap_out: Dict[int, int] = {}
-        blocks_to_copy: Dict[int, List[int]] = {}
+        blocks_to_copy: List[Tuple[int, int]] = []
 
         decode_seq_groups: List[ScheduledSequenceGroup] = []
         prefill_seq_groups: List[ScheduledSequenceGroup] = []
@@ -506,19 +510,31 @@ class Scheduler:
         """
         # Blocks that need to be swapped or copied before model execution.
         blocks_to_swap_in: Dict[int, int] = {}
-        blocks_to_copy: Dict[int, List[int]] = {}
+        blocks_to_copy: List[Tuple[int, int]] = []
         decode_seq_groups: List[ScheduledSequenceGroup] = []
         prefill_seq_groups: List[ScheduledSequenceGroup] = []
         now = time.time()
         swapped_queue = policy.sort_by_priority(now, swapped_queue)
+        infeasible_seq_groups: List[SequenceGroup] = []
 
         leftover_swapped: Deque[SequenceGroup] = deque()
         while swapped_queue:
             seq_group = swapped_queue[0]
 
             # If the sequence group cannot be swapped in, stop.
-            if not self.block_manager.can_swap_in(seq_group):
+            alloc_status = self.block_manager.can_swap_in(seq_group)
+            if alloc_status == AllocStatus.LATER:
                 break
+            elif alloc_status == AllocStatus.NEVER:
+                logger.warning(
+                    "Failing the request %s because there's not enough kv "
+                    "cache blocks to run the entire sequence.",
+                    seq_group.request_id)
+                for seq in seq_group.get_seqs():
+                    seq.status = SequenceStatus.FINISHED_IGNORED
+                infeasible_seq_groups.append(seq_group)
+                swapped_queue.popleft()
+                continue
 
             lora_int_id = 0
             if self.lora_enabled:
@@ -569,7 +585,9 @@ class Scheduler:
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_copy=blocks_to_copy,
             num_lookahead_slots=self._get_num_lookahead_slots(
-                is_prefill=False))
+                is_prefill=False),
+            infeasible_seq_groups=infeasible_seq_groups,
+        )
 
     def _schedule_prefills(
         self,
@@ -775,10 +793,12 @@ class Scheduler:
             num_batched_tokens=budget.num_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
-            blocks_to_copy=merge_dicts(running_scheduled.blocks_to_copy,
-                                       swapped_in.blocks_to_copy),
-            ignored_seq_groups=prefills.ignored_seq_groups,
+            blocks_to_copy=running_scheduled.blocks_to_copy +
+            swapped_in.blocks_to_copy,
+            ignored_seq_groups=prefills.ignored_seq_groups +
+            swapped_in.infeasible_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
+            running_queue_size=len(self.running),
         )
 
     def _schedule_chunked_prefill(self):
@@ -861,10 +881,11 @@ class Scheduler:
             num_batched_tokens=budget.num_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
-            blocks_to_copy=merge_dicts(running_scheduled.blocks_to_copy,
-                                       swapped_in.blocks_to_copy),
+            blocks_to_copy=running_scheduled.blocks_to_copy +
+            swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
+            running_queue_size=len(self.running),
         )
 
     def _schedule(self) -> SchedulerOutputs:
@@ -889,15 +910,6 @@ class Scheduler:
         is_prefill = False
 
         return self.block_manager.can_append_slots(
-            seq_group=seq_group,
-            num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
-        )
-
-    def _can_swap_in(self, seq_group: SequenceGroup) -> bool:
-        # Swapping in is considered decode.
-        is_prefill = False
-
-        return self.block_manager.can_swap_in(
             seq_group=seq_group,
             num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
         )
@@ -998,17 +1010,18 @@ class Scheduler:
     def _append_slots(
         self,
         seq_group: SequenceGroup,
-        blocks_to_copy: Dict[int, List[int]],
+        blocks_to_copy: List[Tuple[int, int]],
     ) -> None:
         """Appends new slots to the sequences in the given sequence group.
 
         Args:
             seq_group (SequenceGroup): The sequence group containing the
                 sequences to append slots to.
-            blocks_to_copy (Dict[int, List[int]]): A dictionary mapping source
-                block indices to lists of destination block indices. This
-                dictionary is updated with the new source and destination block
-                indices for the appended slots.
+            blocks_to_copy (List[Tuple[int, int]]): A list of tuple of two
+                ints, the first int is the source block index, and the second
+                int is the destination block index. This list is updated with
+                the new source and destination block indices for the appended
+                slots.
         """
         num_lookahead_slots = self._get_num_lookahead_slots(is_prefill=False)
 
@@ -1016,9 +1029,8 @@ class Scheduler:
             cows = self.block_manager.append_slots(seq, num_lookahead_slots)
 
             for src, dests in cows.items():
-                if src not in blocks_to_copy:
-                    blocks_to_copy[src] = []
-                blocks_to_copy[src].extend(dests)
+                for dest in dests:
+                    blocks_to_copy.append((src, dest))
 
     def _preempt(
         self,
